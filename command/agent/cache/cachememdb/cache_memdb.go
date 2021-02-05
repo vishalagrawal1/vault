@@ -127,17 +127,6 @@ func newDB() (*memdb.MemDB, error) {
 	return db, nil
 }
 
-// NewSnapshot returns a new CacheMemDB with a snapshot of the current cache
-func (c *CacheMemDB) NewSnapshot() *CacheMemDB {
-	snapshot := &CacheMemDB{
-		db: new(atomic.Value),
-	}
-	memDB := c.db.Load().(*memdb.MemDB).Snapshot()
-	snapshot.db.Store(memDB)
-
-	return snapshot
-}
-
 // Get returns the index based on the indexer and the index values provided.
 func (c *CacheMemDB) Get(indexName string, indexValues ...interface{}) (*Index, error) {
 	if !validIndexName(indexName) {

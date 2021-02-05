@@ -993,29 +993,6 @@ func (c *LeaseCache) ReCreateLeaseRenewCtx(index *cachememdb.Index) error {
 	return nil
 }
 
-// Serialize returns a serialized snapshot of the lease cache db, without renewal contexts
-func (c *LeaseCache) Serialize() ([]byte, error) {
-	snapshot := c.db.NewSnapshot()
-	indices, err := snapshot.GetByPrefix(cachememdb.IndexNameID)
-	if err != nil {
-		return nil, err
-	}
-	indexList := []*cachememdb.Index{}
-	for _, i := range indices {
-		newIndex := *i //shallow copy works here
-		newIndex.RenewCtxInfo = nil
-		indexList = append(indexList, &newIndex)
-		q.Q("appended index ", i.ID) // DEBUG
-	}
-
-	listBytes, err := json.Marshal(indexList)
-	if err != nil {
-		return nil, err
-	}
-
-	return listBytes, nil
-}
-
 // DeSerialize accepts serialized bytes of a cache, de-serializes them, and
 // loads them into the LeaseCache
 func (c *LeaseCache) DeSerialize(cacheBytes []byte) error {

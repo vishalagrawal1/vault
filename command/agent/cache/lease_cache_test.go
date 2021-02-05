@@ -12,7 +12,6 @@ import (
 
 	"github.com/hashicorp/vault/command/agent/cache/cachememdb"
 	"github.com/hashicorp/vault/command/agent/cache/persistcache"
-	"github.com/ryboe/q"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -515,98 +514,6 @@ func TestCache_DeriveNamespaceAndRevocationPath(t *testing.T) {
 	}
 }
 
-func TestCache_SerializeDeserialize(t *testing.T) {
-	// ----- setup cache -----
-	// Emulate 2 responses from the api proxy. One returns a new token and the
-	// other returns a lease.
-	responses := []*SendResponse{
-		newTestSendResponse(http.StatusCreated, `{"auth": {"client_token": "testtoken", "renewable": true}}`),
-		newTestSendResponse(http.StatusOK, `{"lease_id": "foo", "renewable": true, "data": {"value": "foo"}}`),
-	}
-
-	lc := testNewLeaseCache(t, responses, nil)
-	// Register a token so that the token and lease requests are cached
-	lc.RegisterAutoAuthToken("autoauthtoken")
-
-	// Make a request. A response with a new token is returned to the lease
-	// cache and that will be cached.
-	urlPath := "http://example.com/v1/sample/api"
-	sendReq := &SendRequest{
-		Token:   "autoauthtoken",
-		Request: httptest.NewRequest("GET", urlPath, strings.NewReader(`{"value": "input"}`)),
-	}
-	resp, err := lc.Send(context.Background(), sendReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := deep.Equal(resp.Response.StatusCode, responses[0].Response.StatusCode); diff != nil {
-		t.Fatalf("expected getting proxied response: got %v", diff)
-	}
-
-	// Modify the request a little bit to ensure the second response is
-	// returned to the lease cache.
-	sendReq = &SendRequest{
-		Token:   "autoauthtoken",
-		Request: httptest.NewRequest("GET", urlPath, strings.NewReader(`{"value": "input_changed"}`)),
-	}
-	resp, err = lc.Send(context.Background(), sendReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := deep.Equal(resp.Response.StatusCode, responses[1].Response.StatusCode); diff != nil {
-		t.Fatalf("expected getting proxied response: got %v", diff)
-	}
-	// ---------  --------
-
-	testGet, err := lc.db.GetByPrefix(cachememdb.IndexNameID)
-	assert.NoError(t, err)
-	q.Q("in the test", testGet) // DEBUG
-
-	cereal, err := lc.Serialize()
-	assert.NoError(t, err)
-	assert.True(t, len(cereal) > 0)
-
-	restoredLC := testNewLeaseCache(t, nil, nil)
-	err = restoredLC.DeSerialize(cereal)
-	assert.NoError(t, err)
-
-	// Now compare before and after
-	beforeDB, err := lc.db.GetByPrefix(cachememdb.IndexNameID)
-	assert.NoError(t, err)
-	assert.Len(t, beforeDB, 3)
-	for _, cachedItem := range beforeDB {
-		restoredItem, err := restoredLC.db.Get(cachememdb.IndexNameID, cachedItem.ID)
-		assert.NoError(t, err)
-		assert.Equal(t, cachedItem.ID, restoredItem.ID)
-		assert.Equal(t, cachedItem.Lease, restoredItem.Lease)
-		assert.Equal(t, cachedItem.LeaseToken, restoredItem.LeaseToken)
-		assert.Equal(t, cachedItem.Namespace, restoredItem.Namespace)
-		assert.Equal(t, cachedItem.RequestHeader, restoredItem.RequestHeader)
-		assert.Equal(t, cachedItem.RequestMethod, restoredItem.RequestMethod)
-		assert.Equal(t, cachedItem.RequestPath, restoredItem.RequestPath)
-		assert.Equal(t, cachedItem.RequestToken, restoredItem.RequestToken)
-		assert.Equal(t, cachedItem.Response, restoredItem.Response)
-		assert.Equal(t, cachedItem.Token, restoredItem.Token)
-		assert.Equal(t, cachedItem.TokenAccessor, restoredItem.TokenAccessor)
-		assert.Equal(t, cachedItem.TokenParent, restoredItem.TokenParent)
-
-		assert.NotEmpty(t, restoredItem.RenewCtxInfo.CancelFunc)
-		assert.NotZero(t, restoredItem.RenewCtxInfo.DoneCh)
-		require.NotEmpty(t, restoredItem.RenewCtxInfo.Ctx)
-		assert.Equal(t,
-			cachedItem.RenewCtxInfo.Ctx.Value(contextIndexID),
-			restoredItem.RenewCtxInfo.Ctx.Value(contextIndexID),
-		)
-	}
-	afterDB, err := restoredLC.db.GetByPrefix(cachememdb.IndexNameID)
-	assert.NoError(t, err)
-	// assert.ElementsMatch(t, beforeDB, afterDB)
-	assert.Len(t, afterDB, 3)
-
-	q.Q("before cache", beforeDB)  // DEBUG
-	q.Q("restored cache", afterDB) // DEBUG
-}
-
 func TestLeaseCache_CacheAndRestore(t *testing.T) {
 	// Emulate 2 responses from the api proxy. One returns a new token and the
 	// other returns a lease.
@@ -615,12 +522,12 @@ func TestLeaseCache_CacheAndRestore(t *testing.T) {
 		newTestSendResponse(http.StatusOK, `{"lease_id": "foo", "renewable": true, "data": {"value": "foo"}}`),
 	}
 
-	stor := persistcache.NewMapStorage()
-	lc := testNewLeaseCache(t, responses, stor)
-	// b, err := persistcache.NewBoltStorage("/tmp/mybolt.db")
-	// require.NoError(t, err)
-	// require.NotNil(t, b)
-	// lc := testNewLeaseCache(t, responses, b)
+	// stor := persistcache.NewMapStorage()
+	// lc := testNewLeaseCache(t, responses, stor)
+	b, err := persistcache.NewBoltStorage("/tmp/mybolt.db")
+	require.NoError(t, err)
+	require.NotNil(t, b)
+	lc := testNewLeaseCache(t, responses, b)
 
 	// Register an token so that the token and lease requests are cached
 	lc.RegisterAutoAuthToken("autoauthtoken")
@@ -682,13 +589,13 @@ func TestLeaseCache_CacheAndRestore(t *testing.T) {
 	}
 
 	// Now we know the cache is working, so try restoring from the persisted cache
-	q.Q(stor) // DEBUG
+	// q.Q(stor) // DEBUG
 	// q.Q(b) // DEBUG - this segfault's
 
 	restoredCache := testNewLeaseCache(t, nil, nil)
 
-	err = restoredCache.Restore(stor)
-	// err = restoredCache.Restore(b)
+	// err = restoredCache.Restore(stor)
+	err = restoredCache.Restore(b)
 	assert.NoError(t, err)
 
 	// Now compare before and after
