@@ -48,6 +48,13 @@ type Cache struct {
 	UseAutoAuthTokenRaw interface{} `hcl:"use_auto_auth_token"`
 	UseAutoAuthToken    bool        `hcl:"-"`
 	ForceAutoAuthToken  bool        `hcl:"-"`
+	Snapshot            *Snapshot   `hcl:"snapshot,block"`
+}
+
+// Snapshot contains configuration needed for persistent caching
+type Snapshot struct {
+	Export bool   `hcl:"export"`
+	Path   string `hcl:"path"`
 }
 
 // AutoAuth is the configured authentication method and sinks
@@ -305,8 +312,41 @@ func parseCache(result *Config, list *ast.ObjectList) error {
 			}
 		}
 	}
-
 	result.Cache = &c
+
+	subs, ok := item.Val.(*ast.ObjectType)
+	if !ok {
+		return fmt.Errorf("could not parse %q as an object", name)
+	}
+	subList := subs.List
+	if err := parseSnapshot(result, subList); err != nil {
+		return fmt.Errorf("error parsing snapshot: %w", err)
+	}
+
+	return nil
+}
+
+func parseSnapshot(result *Config, list *ast.ObjectList) error {
+	name := "snapshot"
+
+	snapshotList := list.Filter(name)
+	if len(snapshotList.Items) == 0 {
+		return nil
+	}
+
+	if len(snapshotList.Items) > 1 {
+		return fmt.Errorf("only one %q block is required", name)
+	}
+
+	item := snapshotList.Items[0]
+
+	var s Snapshot
+	err := hcl.DecodeObject(&s, item.Val)
+	if err != nil {
+		return err
+	}
+
+	result.Cache.Snapshot = &s
 	return nil
 }
 

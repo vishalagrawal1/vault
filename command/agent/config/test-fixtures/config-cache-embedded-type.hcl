@@ -21,6 +21,10 @@ auto_auth {
 
 cache {
 	use_auto_auth_token = true
+	snapshot = {
+		export = true
+		path = "/tmp/bolt-file.db"
+	}
 }
 
 listener {
