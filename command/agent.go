@@ -464,6 +464,7 @@ func (c *AgentCommand) Run(args []string) int {
 			Proxier:     apiProxy,
 			Logger:      cacheLogger.Named("leasecache"),
 		})
+		// TODO(tvoran): add persistence config if enabled here
 		if err != nil {
 			c.UI.Error(fmt.Sprintf("Error creating lease cache: %v", err))
 			return 1
