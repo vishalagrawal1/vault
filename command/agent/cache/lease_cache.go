@@ -29,7 +29,9 @@ import (
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
 	"github.com/hashicorp/vault/sdk/helper/locksutil"
 	"github.com/hashicorp/vault/sdk/logical"
+	gocache "github.com/patrickmn/go-cache"
 	"github.com/ryboe/q"
+	"go.uber.org/atomic"
 )
 
 const (
@@ -82,6 +84,9 @@ type LeaseCache struct {
 	// in parallel won't trigger multiple renewal goroutines.
 	idLocks []*locksutil.LockEntry
 
+	// inflightCache keeps track of inflight requests
+	inflightCache *gocache.Cache
+
 	ps persistcache.Storage
 }
 
@@ -93,6 +98,22 @@ type LeaseCacheConfig struct {
 	Proxier     Proxier
 	Logger      hclog.Logger
 	Storage     persistcache.Storage
+}
+
+type inflightRequest struct {
+	// ch is closed by the request that ends up processing the set of
+	// parallel request
+	ch chan struct{}
+
+	// remaining is the number of remaining inflight request that needs to
+	// be processed before this object can be cleaned up
+	remaining atomic.Uint64
+}
+
+func newInflightRequest() *inflightRequest {
+	return &inflightRequest{
+		ch: make(chan struct{}),
+	}
 }
 
 // NewLeaseCache creates a new instance of a LeaseCache.
@@ -121,14 +142,15 @@ func NewLeaseCache(conf *LeaseCacheConfig) (*LeaseCache, error) {
 	// set storage interface to something
 
 	return &LeaseCache{
-		client:      conf.Client,
-		proxier:     conf.Proxier,
-		logger:      conf.Logger,
-		db:          db,
-		baseCtxInfo: baseCtxInfo,
-		l:           &sync.RWMutex{},
-		idLocks:     locksutil.CreateLocks(),
-		ps:          conf.Storage,
+		client:        conf.Client,
+		proxier:       conf.Proxier,
+		logger:        conf.Logger,
+		db:            db,
+		baseCtxInfo:   baseCtxInfo,
+		l:             &sync.RWMutex{},
+		idLocks:       locksutil.CreateLocks(),
+		inflightCache: gocache.New(gocache.NoExpiration, gocache.NoExpiration),
+		ps:            conf.Storage,
 	}, nil
 }
 
@@ -181,40 +203,60 @@ func (c *LeaseCache) Send(ctx context.Context, req *SendRequest) (*SendResponse,
 		return nil, err
 	}
 
-	// Grab a read lock for this particular request
+	// Check the inflight cache to see if there are other inflight requests
+	// of the same kind, based on the computed ID. If so, we increment a counter
+
+	var inflight *inflightRequest
+
+	defer func() {
+		// Cleanup on the cache if there are no remaining inflight requests.
+		// This is the last step, so we defer the call first
+		if inflight != nil && inflight.remaining.Load() == 0 {
+			c.inflightCache.Delete(id)
+		}
+	}()
+
 	idLock := locksutil.LockForKey(c.idLocks, id)
 
-	idLock.RLock()
-	unlockFunc := idLock.RUnlock
-	defer func() { unlockFunc() }()
+	// Briefly grab an ID-based lock in here to emulate a load-or-store behavior
+	// and prevent concurrent cacheable requests from being proxied twice if
+	// they both miss the cache due to it being clean when peeking the cache
+	// entry.
+	idLock.Lock()
+	inflightRaw, found := c.inflightCache.Get(id)
+	if found {
+		idLock.Unlock()
+		inflight = inflightRaw.(*inflightRequest)
+		inflight.remaining.Inc()
+		defer inflight.remaining.Dec()
+
+		// If found it means that there's an inflight request being processed.
+		// We wait until that's finished before proceeding further.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-inflight.ch:
+		}
+	} else {
+		inflight = newInflightRequest()
+		inflight.remaining.Inc()
+		defer inflight.remaining.Dec()
+
+		c.inflightCache.Set(id, inflight, gocache.NoExpiration)
+		idLock.Unlock()
+
+		// Signal that the processing request is done
+		defer close(inflight.ch)
+	}
 
 	// Check if the response for this request is already in the cache
-	sendResp, err := c.checkCacheForRequest(id)
+	cachedResp, err := c.checkCacheForRequest(id)
 	if err != nil {
 		return nil, err
 	}
-	if sendResp != nil {
+	if cachedResp != nil {
 		c.logger.Debug("returning cached response", "path", req.Request.URL.Path)
-		return sendResp, nil
-	}
-
-	// Perform a lock upgrade
-	idLock.RUnlock()
-	idLock.Lock()
-	unlockFunc = idLock.Unlock
-
-	// Check cache once more after upgrade
-	sendResp, err = c.checkCacheForRequest(id)
-	if err != nil {
-		return nil, err
-	}
-
-	// If found, it means that some other parallel request already cached this response
-	// in between this upgrade so we can simply return that. Otherwise, this request
-	// will be the one performing the cache write.
-	if sendResp != nil {
-		c.logger.Debug("returning cached response", "method", req.Request.Method, "path", req.Request.URL.Path)
-		return sendResp, nil
+		return cachedResp, nil
 	}
 
 	c.logger.Debug("forwarding request", "method", req.Request.Method, "path", req.Request.URL.Path)
@@ -322,7 +364,7 @@ func (c *LeaseCache) Send(ctx context.Context, req *SendRequest) (*SendResponse,
 			c.logger.Debug("setting parent context", "method", req.Request.Method, "path", req.Request.URL.Path)
 			parentCtx = entry.RenewCtxInfo.Ctx
 
-			entry.TokenParent = req.Token
+			index.TokenParent = req.Token
 		}
 
 		renewCtxInfo = c.createCtxInfo(parentCtx)
@@ -458,7 +500,7 @@ func (c *LeaseCache) startRenewing(ctx context.Context, index *cachememdb.Index,
 func computeIndexID(req *SendRequest) (string, error) {
 	var b bytes.Buffer
 
-	// Serialze the request
+	// Serialize the request
 	if err := req.Request.Write(&b); err != nil {
 		return "", fmt.Errorf("failed to serialize request: %v", err)
 	}
